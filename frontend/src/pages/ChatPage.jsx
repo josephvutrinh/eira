@@ -1,4 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { buildSupportReply } from '../services/chatApi'
+import {
+  clearChatMessages,
+  fetchChatMessages,
+  getOrCreateSessionId,
+  insertChatMessage,
+} from '../services/chatStore'
 
 const STORAGE_KEY = 'eira_chat_v1'
 
@@ -17,29 +24,6 @@ function formatTime(iso) {
 
 function uid() {
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`
-}
-
-function buildSupportReply(userText) {
-  const text = (userText || '').toLowerCase()
-
-  // Keep responses supportive and non-medical; gently encourage professional care when needed.
-  if (text.includes('hot flash') || text.includes('hot flashes')) {
-    return "That sounds really uncomfortable. Hot flashes can be exhausting. If you want, you can log when they happen (time, intensity, triggers like caffeine/alcohol/stress) and we can look for patterns. If symptoms feel severe or are changing quickly, consider checking in with a clinician."
-  }
-
-  if (text.includes('sleep') || text.includes('insomnia') || text.includes('tired')) {
-    return "Sleep disruption is very common around perimenopause/menopause. If you’d like, tell me what your nights look like (bedtime, wake-ups, night sweats, stress level) and we can brainstorm gentle routines to try. If you’re feeling unsafe, extremely depressed, or unable to function, it’s important to seek professional support."
-  }
-
-  if (text.includes('anx') || text.includes('panic') || text.includes('mood') || text.includes('depress')) {
-    return "I’m here with you. Mood changes can feel intense and isolating. If you can, share what you’re noticing (when it started, what helps, what makes it worse). If you’re thinking about harming yourself or feel in danger, please call local emergency services right now."
-  }
-
-  if (text.includes('help') || text.includes('support')) {
-    return "I’m here to support you. What’s the biggest thing you want help with today—symptoms, sleep, stress, or tracking what you’re experiencing?"
-  }
-
-  return "Thanks for sharing that. I’m here with you. If you tell me a bit more about what you’re experiencing (what, when it started, how often, how intense), I can help you organize it for your symptom log and suggest questions to bring to a clinician."
 }
 
 function MessageBubble({ message }) {
@@ -69,6 +53,8 @@ function MessageBubble({ message }) {
 }
 
 export default function ChatPage() {
+  const sessionId = useMemo(() => getOrCreateSessionId(), [])
+
   const [messages, setMessages] = useState(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY)
@@ -95,6 +81,35 @@ export default function ChatPage() {
   }, [messages])
 
   useEffect(() => {
+    // Best-effort: if Supabase is configured, load persisted history.
+    let cancelled = false
+
+    ;(async () => {
+      const { data, error } = await fetchChatMessages({ sessionId, limit: 50 })
+      if (cancelled) return
+      if (error) {
+        console.error('fetchChatMessages error', error)
+        return
+      }
+      if (!data || data.length === 0) return
+
+      // Map Supabase rows to the shape ChatPage expects.
+      const mapped = data.map((row) => ({
+        id: row.id,
+        role: row.role,
+        text: row.text,
+        createdAt: row.created_at,
+      }))
+
+      setMessages(mapped)
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [sessionId])
+
+  useEffect(() => {
     // Auto-scroll to bottom when messages change.
     const el = listRef.current
     if (!el) return
@@ -113,27 +128,51 @@ export default function ChatPage() {
     [],
   )
 
-  function addMessage(role, text) {
-    const msg = {
+  async function addMessage(role, text) {
+    const createdAt = nowIso()
+
+    // Optimistic UI update.
+    const optimistic = {
       id: uid(),
       role,
       text,
-      createdAt: nowIso(),
+      createdAt,
     }
-    setMessages((prev) => [...prev, msg])
+    setMessages((prev) => [...prev, optimistic])
+
+    const { data, error } = await insertChatMessage({
+      sessionId,
+      role,
+      text,
+      createdAt,
+    })
+
+    if (error) {
+      console.error('insertChatMessage error', error)
+      return optimistic
+    }
+
+    if (data?.id) {
+      // Replace optimistic id with DB id (keeps React keys stable long-term).
+      setMessages((prev) =>
+        prev.map((m) => (m.id === optimistic.id ? { ...m, id: data.id } : m)),
+      )
+    }
+
+    return optimistic
   }
 
   async function handleSend(textOverride) {
     const text = (textOverride ?? input).trim()
     if (!text || isTyping) return
 
-    addMessage('user', text)
+    await addMessage('user', text)
     setInput('')
 
-    // Simulate a support response.
+    // Simulate a support response (replace later with a backend call).
     setIsTyping(true)
     await new Promise((r) => setTimeout(r, 450))
-    addMessage('support', buildSupportReply(text))
+    await addMessage('support', buildSupportReply(text))
     setIsTyping(false)
 
     // Keep focus in the input for “chat-like” UX.
@@ -147,15 +186,19 @@ export default function ChatPage() {
     }
   }
 
-  function handleClear() {
+  async function handleClear() {
     setMessages([])
     setInput('')
     setIsTyping(false)
+
     try {
       localStorage.removeItem(STORAGE_KEY)
     } catch {
       // ignore
     }
+
+    const { error } = await clearChatMessages({ sessionId })
+    if (error) console.error('clearChatMessages error', error)
   }
 
   return (
