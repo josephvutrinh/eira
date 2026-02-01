@@ -1,11 +1,8 @@
 import './App.css'
+import ChatPage from './pages/ChatPage.jsx'
 
 function App() {
-  return (
-    <>
-      <h1>Hello</h1>
-    </>
-  )
+  return <ChatPage />
 }
 
 export default App
